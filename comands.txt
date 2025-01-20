@@ -1,0 +1,13 @@
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y python3 python3-pip python3-venv git curl
+nvidia-smi
+nvcc --version
+mkdir faster_whisper_api
+cd faster_whisper_api
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install faster-whisper fastapi uvicorn av
+sudo ufw allow 8000
+sudo ufw enable
+python app.py
