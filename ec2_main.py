@@ -112,13 +112,15 @@ async def handle_media_stream(websocket: WebSocket):
     print("Client connected")
     await websocket.accept()
     
-    async with websockets.connect(
-        'wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview',
-        extra_headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "OpenAI-Beta": "realtime=v1"
-        }
-    ) as openai_ws:
+    openai_ws = None
+    try:
+        openai_ws = await websockets.connect(
+            'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
+            extra_headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "OpenAI-Beta": "realtime=v1"
+            }
+        )
         await initialize_session(openai_ws)
 
         # Connection specific state
@@ -150,10 +152,12 @@ async def handle_media_stream(websocket: WebSocket):
                     elif data['event'] == 'mark':
                         if mark_queue:
                             mark_queue.pop(0)
+                    elif data['event'] == 'stop':
+                        print(f"Stream {stream_sid} has ended")
+                        raise WebSocketDisconnect()
             except WebSocketDisconnect:
                 print("Client disconnected.")
-                if openai_ws.open:
-                    await openai_ws.close()
+                raise  # Re-raise to trigger cleanup
 
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
@@ -163,24 +167,6 @@ async def handle_media_stream(websocket: WebSocket):
                     response = json.loads(openai_message)
                     if response['type'] in LOG_EVENT_TYPES:
                         print(f"Received event: {response['type']}", response)
-
-                    # Handle function calls
-                    if response.get('type') == 'response.output_item.done':
-                        item = response.get('item', {})
-                        if item.get('type') == 'function_call':
-                            if item['name'] == 'dummy_function':
-                                result = await dummy_function()
-                                # Send function result back to OpenAI
-                                await openai_ws.send(json.dumps({
-                                    "type": "conversation.item.create",
-                                    "item": {
-                                        "type": "function_call_output",
-                                        "call_id": item['call_id'],
-                                        "output": json.dumps(result)
-                                    }
-                                }))
-                                # Request response generation
-                                await openai_ws.send(json.dumps({"type": "response.create"}))
 
                     if response.get('type') == 'response.audio.delta' and 'delta' in response:
                         audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
@@ -198,13 +184,11 @@ async def handle_media_stream(websocket: WebSocket):
                             if SHOW_TIMING_MATH:
                                 print(f"Setting start timestamp for new response: {response_start_timestamp_twilio}ms")
 
-                        # Update last_assistant_item safely
                         if response.get('item_id'):
                             last_assistant_item = response['item_id']
 
                         await send_mark(websocket, stream_sid)
 
-                    # Trigger an interruption. Your use case might work better using `input_audio_buffer.speech_stopped`, or combining the two.
                     if response.get('type') == 'input_audio_buffer.speech_started':
                         print("Speech started detected.")
                         if last_assistant_item:
@@ -260,15 +244,25 @@ async def handle_media_stream(websocket: WebSocket):
         # Run both tasks and wait for either to complete/fail
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
         
+    except WebSocketDisconnect:
+        print("Cleaning up connections...")
+    except Exception as e:
+        print(f"Error in handle_media_stream: {e}")
+    finally:
         # Clean up OpenAI connection
         if openai_ws and not openai_ws.closed:
-            await openai_ws.close()
-            print("OpenAI connection closed")
+            try:
+                await openai_ws.close()
+                print("OpenAI connection closed")
+            except Exception as e:
+                print(f"Error closing OpenAI connection: {e}")
         
         # Clean up Twilio connection
-        if not websocket.client_state.disconnected:
+        try:
             await websocket.close()
             print("Twilio connection closed")
+        except Exception as e:
+            print(f"Error closing Twilio connection: {e}")
         
         # Clean up any temp files if they exist
         try:
