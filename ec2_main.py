@@ -112,15 +112,13 @@ async def handle_media_stream(websocket: WebSocket):
     print("Client connected")
     await websocket.accept()
     
-    openai_ws = None
-    try:
-        openai_ws = await websockets.connect(
-            'wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview',
-            extra_headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "OpenAI-Beta": "realtime=v1"
-            }
-        )
+    async with websockets.connect(
+        'wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview',
+        extra_headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "OpenAI-Beta": "realtime=v1"
+        }
+    ) as openai_ws:
         await initialize_session(openai_ws)
 
         # Connection specific state
@@ -152,12 +150,10 @@ async def handle_media_stream(websocket: WebSocket):
                     elif data['event'] == 'mark':
                         if mark_queue:
                             mark_queue.pop(0)
-                    elif data['event'] == 'stop':
-                        print(f"Stream {stream_sid} has ended")
-                        raise WebSocketDisconnect()
             except WebSocketDisconnect:
                 print("Client disconnected.")
-                raise  # Re-raise to trigger cleanup in outer try/except
+                if openai_ws.open:
+                    await openai_ws.close()
 
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
@@ -264,11 +260,6 @@ async def handle_media_stream(websocket: WebSocket):
         # Run both tasks and wait for either to complete/fail
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
         
-    except WebSocketDisconnect:
-        print("Cleaning up connections...")
-    except Exception as e:
-        print(f"Error in handle_media_stream: {e}")
-    finally:
         # Clean up OpenAI connection
         if openai_ws and not openai_ws.closed:
             await openai_ws.close()
