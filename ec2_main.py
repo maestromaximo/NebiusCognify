@@ -8,19 +8,39 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
 from dotenv import load_dotenv
+import aiohttp
 
 load_dotenv()
 
 # Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 PORT = int(os.getenv('PORT', 5050))
-SYSTEM_MESSAGE = (
-    "You are a helpful and bubbly AI assistant who loves to chat about "
-    "anything the user is interested in and is prepared to offer them facts. "
-    "You have a penchant for dad jokes, owl jokes, and rickrolling – subtly. "
-    "Always stay positive, but work in a joke when appropriate."
-)
-VOICE = 'alloy'
+SYSTEM_MESSAGE = """
+You are Cognify's dedicated AI learning assistant, designed to be your personal academic companion. Your responses should be:
+
+1. Educational and Insightful
+   - Explain concepts clearly and thoroughly
+   - Draw connections between related topics
+   - Break down complex ideas into understandable parts
+
+2. Encouraging and Supportive
+   - Maintain a positive, motivating tone
+   - Celebrate understanding and progress
+   - Guide users through challenging concepts patiently
+
+3. Professional yet Approachable
+   - Speak like an experienced, friendly tutor
+   - Balance academic precision with conversational warmth
+   - Use clear, concise language while remaining engaging
+
+4. Contextually Aware
+   - Reference relevant class materials when available
+   - Connect discussions to previous lessons when applicable
+   - Suggest related topics or resources that might be helpful
+
+Remember: You're not just providing information, you're supporting their learning journey. Help them understand not just the 'what' but also the 'why' and 'how' of their academic questions."""
+
+VOICE = 'sage'
 LOG_EVENT_TYPES = [
     'error', 'response.content.done', 'rate_limits.updated',
     'response.done', 'input_audio_buffer.committed',
@@ -41,15 +61,49 @@ async def index_page():
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     """Handle incoming call and return TwiML response to connect to Media Stream."""
+    # Get form data from the request
+    form_data = await request.form()
+    
+    # Get the caller's phone number
+    caller_number = form_data.get('From', 'Unknown')
+    print(f"Incoming call from: {caller_number}")
+    
     response = VoiceResponse()
-    # <Say> punctuation to improve text-to-speech flow
-    response.say("Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Open-A.I. Realtime API")
+    response.say("We are connecting you to Cognify. Please wait while we verify your account.")
     response.pause(length=1)
-    response.say("O.K. you can start talking!")
-    host = request.url.hostname
-    connect = Connect()
-    connect.stream(url=f'wss://{host}/media-stream')
-    response.append(connect)
+    
+    # Setup API request
+    DATABASE_API_KEY = os.getenv('DATABASE_API_KEY')
+    api_url = "https://www.cognify.cc/education/api/user-data-by-phone/"
+    headers = {"X-API-Key": DATABASE_API_KEY}
+    payload = {"phone_number": caller_number}
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(api_url, json=payload, headers=headers) as api_response:
+                if api_response.status == 200:
+                    # Get user data and save to file
+                    user_data = await api_response.json()
+                    temp_filename = f"tempdata_{caller_number.replace('+', '')}.json"
+                    try:
+                        with open(temp_filename, 'w') as f:
+                            json.dump(user_data, f)
+                    except Exception as e:
+                        print(f"Error saving data: {e}")
+                    
+                    # User found, proceed with connection
+                    response.say("Thank you for waiting! Connected! Ask what you need!")
+                    host = request.url.hostname
+                    connect = Connect()
+                    connect.stream(url=f'wss://{host}/media-stream')
+                    response.append(connect)
+                else:
+                    # User not found or other error
+                    response.say("Sorry, it seems your phone number is not registered. Please make sure to create an account at cognify dot cc and then link your number. Have a great day!")
+    except Exception as e:
+        print(f"API request error: {e}")
+        response.say("We're experiencing technical difficulties. Please try again later.")
+    
     return HTMLResponse(content=str(response), media_type="application/xml")
 
 @app.websocket("/media-stream")
