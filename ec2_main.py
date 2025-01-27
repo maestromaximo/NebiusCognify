@@ -111,14 +111,16 @@ async def handle_media_stream(websocket: WebSocket):
     """Handle WebSocket connections between Twilio and OpenAI."""
     print("Client connected")
     await websocket.accept()
-
-    async with websockets.connect(
-        'wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview',
-        extra_headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "OpenAI-Beta": "realtime=v1"
-        }
-    ) as openai_ws:
+    
+    openai_ws = None
+    try:
+        openai_ws = await websockets.connect(
+            'wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview',
+            extra_headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "OpenAI-Beta": "realtime=v1"
+            }
+        )
         await initialize_session(openai_ws)
 
         # Connection specific state
@@ -150,10 +152,12 @@ async def handle_media_stream(websocket: WebSocket):
                     elif data['event'] == 'mark':
                         if mark_queue:
                             mark_queue.pop(0)
+                    elif data['event'] == 'stop':
+                        print(f"Stream {stream_sid} has ended")
+                        raise WebSocketDisconnect()
             except WebSocketDisconnect:
                 print("Client disconnected.")
-                if openai_ws.open:
-                    await openai_ws.close()
+                raise  # Re-raise to trigger cleanup in outer try/except
 
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
@@ -163,6 +167,24 @@ async def handle_media_stream(websocket: WebSocket):
                     response = json.loads(openai_message)
                     if response['type'] in LOG_EVENT_TYPES:
                         print(f"Received event: {response['type']}", response)
+
+                    # Handle function calls
+                    if response.get('type') == 'response.output_item.done':
+                        item = response.get('item', {})
+                        if item.get('type') == 'function_call':
+                            if item['name'] == 'dummy_function':
+                                result = await dummy_function()
+                                # Send function result back to OpenAI
+                                await openai_ws.send(json.dumps({
+                                    "type": "conversation.item.create",
+                                    "item": {
+                                        "type": "function_call_output",
+                                        "call_id": item['call_id'],
+                                        "output": json.dumps(result)
+                                    }
+                                }))
+                                # Request response generation
+                                await openai_ws.send(json.dumps({"type": "response.create"}))
 
                     if response.get('type') == 'response.audio.delta' and 'delta' in response:
                         audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
@@ -192,8 +214,12 @@ async def handle_media_stream(websocket: WebSocket):
                         if last_assistant_item:
                             print(f"Interrupting response with id: {last_assistant_item}")
                             await handle_speech_started_event()
+            except websockets.exceptions.ConnectionClosed:
+                print("OpenAI connection closed")
+                raise WebSocketDisconnect()
             except Exception as e:
                 print(f"Error in send_to_twilio: {e}")
+                raise WebSocketDisconnect()
 
         async def handle_speech_started_event():
             """Handle interruption when the caller's speech starts."""
@@ -235,7 +261,32 @@ async def handle_media_stream(websocket: WebSocket):
                 await connection.send_json(mark_event)
                 mark_queue.append('responsePart')
 
+        # Run both tasks and wait for either to complete/fail
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
+        
+    except WebSocketDisconnect:
+        print("Cleaning up connections...")
+    except Exception as e:
+        print(f"Error in handle_media_stream: {e}")
+    finally:
+        # Clean up OpenAI connection
+        if openai_ws and not openai_ws.closed:
+            await openai_ws.close()
+            print("OpenAI connection closed")
+        
+        # Clean up Twilio connection
+        if not websocket.client_state.disconnected:
+            await websocket.close()
+            print("Twilio connection closed")
+        
+        # Clean up any temp files if they exist
+        try:
+            temp_files = [f for f in os.listdir('.') if f.startswith('tempdata_')]
+            for f in temp_files:
+                os.remove(f)
+                print(f"Removed temp file: {f}")
+        except Exception as e:
+            print(f"Error cleaning up temp files: {e}")
 
 async def send_initial_conversation_item(openai_ws):
     """Send initial conversation item if AI talks first."""
@@ -255,6 +306,9 @@ async def send_initial_conversation_item(openai_ws):
     await openai_ws.send(json.dumps(initial_conversation_item))
     await openai_ws.send(json.dumps({"type": "response.create"}))
 
+async def dummy_function():
+    """Simple dummy function that returns a fixed string."""
+    return "duck duck go, function called and ready to go"
 
 async def initialize_session(openai_ws):
     """Control initial session with OpenAI."""
@@ -268,6 +322,18 @@ async def initialize_session(openai_ws):
             "instructions": SYSTEM_MESSAGE,
             "modalities": ["text", "audio"],
             "temperature": 0.8,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "dummy_function",
+                    "description": "A test function that always returns the same string",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                }
+            }]
         }
     }
     print('Sending session update:', json.dumps(session_update))
